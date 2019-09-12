@@ -9,32 +9,64 @@
 #include <assert.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include "MethylDackel.h"
-
 void print_version(void);
 
-void addRead(kstring_t *os, bam1_t *b, bam_hdr_t *hdr, uint32_t nmethyl, uint32_t nunmethyl) {
+bool nonZeroArray(uint32_t arr[]) {
+  for(int i=0; i < 4; i++) {
+    if(arr[i] != 0) return true;
+  }
+  return false;
+}
+
+uint32_t sumArray(uint32_t arr[]) {
+  uint32_t sum=0;
+  for(int i=0; i < 4; i++) {
+    sum += arr[i];
+  }
+  return sum;
+}
+
+void zeroList(uint32_t arr[]) {
+  for(int i=0; i < 4; i++) {
+    arr[i]=0;
+  }
+}
+
+void addRead(kstring_t *os, bam1_t *b, bam_hdr_t *hdr, uint32_t cg[], uint32_t chg[], uint32_t chh[]) {
     char str[10000]; // I don't really like hardcoding it, but given the probability that it ever won't suffice...
 
-    if(nmethyl + nunmethyl > 0) {
-        snprintf(str, 10000, "%s\t%s\t%i\t%f\t%"PRIu32"\n",
-            bam_get_qname(b),
+    if(nonZeroArray(cg)) {
+        snprintf(str, 10000, "%s\t%d\t%d\t%f\tCpG\n",
             hdr->target_name[b->core.tid],
             b->core.pos,
-            100. * ((double) nmethyl)/(nmethyl+nunmethyl),
-            nmethyl + nunmethyl);
-    } else {
-        snprintf(str, 10000, "%s\t%s\t%i\t0.0\t%"PRIu32"\n",
-            bam_get_qname(b),
-            hdr->target_name[b->core.tid],
-            b->core.pos,
-            nmethyl + nunmethyl);
+            bam_endpos(b),
+            100. * ((double) (cg[0]+cg[3])/sumArray(cg))
+          );
     }
-
+    kputs(str, os);
+    if(nonZeroArray(chg)) {
+        snprintf(str, 10000, "%s\t%d\t%d\t%f\tCHG\n",
+            hdr->target_name[b->core.tid],
+            b->core.pos,
+            bam_endpos(b),
+            100. * ((double) chg[0]+chg[3])/sumArray(chg)
+          );
+    }
+    kputs(str, os);
+    if(nonZeroArray(chh)) {
+        snprintf(str, 10000, "%s\t%d\t%d\t%f\tCHH\n",
+            hdr->target_name[b->core.tid],
+            b->core.pos,
+            bam_endpos(b),
+            100. * ((double) chh[0]+chh[3])/sumArray(chh)
+          );
+    }
     kputs(str, os);
 }
 
-void processRead(Config *config, bam1_t *b, char *seq, uint32_t sequenceStart, int seqLen, uint32_t *nmethyl, uint32_t *nunmethyl) {
+void processRead(Config *config, bam1_t *b, char *seq, uint32_t sequenceStart, int seqLen, uint32_t cg[], uint32_t chg[], uint32_t chh[]) {
     uint32_t readPosition = 0;
     uint32_t mappedPosition = b->core.pos;
     int cigarOPNumber = 0;
@@ -46,6 +78,9 @@ void processRead(Config *config, bam1_t *b, char *seq, uint32_t sequenceStart, i
     int cigarOPType;
     int direction;
     int base;
+    int last_cg = -1;
+    int last_chg = -1;
+    int last_chh = -1;
 
     while(readPosition < b->core.l_qseq && cigarOPNumber < b->core.n_cigar) {
         if(cigarOPOffset >= bam_cigar_oplen(CIGAR[cigarOPNumber])) {
@@ -66,11 +101,81 @@ void processRead(Config *config, bam1_t *b, char *seq, uint32_t sequenceStart, i
                 if(direction) {
                     base = bam_seqi(readSeq, readPosition);  // Filtering by quality goes here
                     if(direction == 1 && (strand & 1) == 1) { // C & OT/CTOT
-                        if(base == 2) (*nmethyl)++;  //C
-                        else if(base == 8) (*nunmethyl)++; //T
+                        if(base == 2) {
+                          if(last_cg == 1) cg[3]++;
+                          else if(last_cg == 0) cg[2]++;
+                          last_cg = 1; //C
+                        }
+                        else if(base == 8) {
+                          if(last_cg == 1) cg[1]++;
+                          else if(last_cg == 0) cg[0]++;
+                          last_cg = 0; //T
+                        }
                     } else if(direction == -1 && (strand & 1) == 0) { // G & OB/CTOB
-                        if(base == 4) (*nmethyl)++;  //G
-                        else if(base == 1) (*nunmethyl)++; //A
+                      if(base == 4) {
+                        if(last_cg == 1) cg[3]++;
+                        else if(last_cg == 0) cg[2]++;
+                        last_cg = 1; //G
+                      }
+                      else if(base == 1) {
+                        if(last_cg == 1) cg[1]++;
+                        else if(last_cg == 0) cg[0]++;
+                        last_cg = 0; //A
+                      }
+                    }
+                }
+                direction = isCHG(seq, mappedPosition - sequenceStart, seqLen);
+                if(direction) {
+                    base = bam_seqi(readSeq, readPosition);  // Filtering by quality goes here
+                    if(direction == 1 && (strand & 1) == 1) { // C & OT/CTOT
+                        if(base == 2) {
+                          if(last_chg == 1) chg[3]++;
+                          else if(last_chg == 0) chg[2]++;
+                          last_chg = 1; //C
+                        }
+                        else if(base == 8) {
+                          if(last_chg == 1) chg[1]++;
+                          else if(last_chg == 0) chg[0]++;
+                          last_chg = 0; //T
+                        }
+                    } else if(direction == -1 && (strand & 1) == 0) { // G & OB/CTOB
+                      if(base == 4) {
+                        if(last_chg == 1) chg[3]++;
+                        else if(last_chg == 0) chg[2]++;
+                        last_chg = 1; //G
+                      }
+                      else if(base == 1) {
+                        if(last_chg == 1) chg[1]++;
+                        else if(last_chg == 0) chg[0]++;
+                        last_chg = 0; //A
+                      }
+                    }
+                }
+                direction = isCHH(seq, mappedPosition - sequenceStart, seqLen);
+                if(direction) {
+                    base = bam_seqi(readSeq, readPosition);  // Filtering by quality goes here
+                    if(direction == 1 && (strand & 1) == 1) { // C & OT/CTOT
+                        if(base == 2) {
+                          if(last_chh == 1) chh[3]++;
+                          else if(last_chh == 0) chh[2]++;
+                          last_chh = 1; //C
+                        }
+                        else if(base == 8) {
+                          if(last_chh == 1) chh[1]++;
+                          else if(last_chh == 0) chh[0]++;
+                          last_chh = 0; //T
+                        }
+                    } else if(direction == -1 && (strand & 1) == 0) { // G & OB/CTOB
+                      if(base == 4) {
+                        if(last_chh == 1) chh[3]++;
+                        else if(last_chh == 0) chh[2]++;
+                        last_chh = 1; //G
+                      }
+                      else if(base == 1) {
+                        if(last_chh == 1) chh[1]++;
+                        else if(last_chh == 0) chh[0]++;
+                        last_chh = 0; //A
+                      }
                     }
                 }
                 mappedPosition++;
@@ -98,7 +203,7 @@ void *perReadMetrics(void *foo) {
     bam_hdr_t *hdr;
     int32_t bedIdx = 0;
     int seqlen;
-    uint32_t nmethyl = 0, nunmethyl = 0;
+    uint32_t cg[4]={0,0,0,0}, chg[4]={0,0,0,0}, chh[4]={0,0,0,0};
     uint32_t localBin = 0, localPos = 0, localEnd = 0, localTid = 0, localPos2 = 0;
     char *seq = NULL;
     kstring_t *os = NULL;
@@ -187,12 +292,14 @@ void *perReadMetrics(void *foo) {
         while(sam_itr_next(fp, iter, b) >= 0) {
             if(b->core.pos < localPos) continue;
             if(b->core.pos >= localEnd) break;
-            nmethyl = 0, nunmethyl = 0;
+            zeroList(cg);
+            zeroList(chg);
+            zeroList(chh);
             if(config->requireFlags && (config->requireFlags & b->core.flag) == 0) continue;
             if(config->ignoreFlags && (config->ignoreFlags & b->core.flag) != 0) continue;
             if(b->core.qual < config->minMapq) continue;
-            processRead(config, b, seq, localPos2, seqlen, &nmethyl, &nunmethyl);
-            addRead(os, b, hdr, nmethyl, nunmethyl);
+            processRead(config, b, seq, localPos2, seqlen, cg, chg, chh);
+            addRead(os, b, hdr, cg, chg, chh);
         }
         sam_itr_destroy(iter);
         free(seq);
@@ -277,7 +384,7 @@ int perRead_main(int argc, char *argv[]) {
     char c;
 
     //Defaults
-    config.keepCpG = 1; config.keepCHG = 0; config.keepCHH = 0;
+    config.keepCpG = 1; config.keepCHG = 1; config.keepCHH = 1;
     config.minMapq = 10; config.minPhred = 5; config.keepDupes = 0;
     config.keepSingleton = 0, config.keepDiscordant = 0;
     config.fp = NULL;
